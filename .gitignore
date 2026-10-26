@@ -27,3 +27,6 @@ sample_docs/
 *.log
 .DS_Store
 Thumbs.db
+
+# Local scratch / diffs
+frontend_diff.txt

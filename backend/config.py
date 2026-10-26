@@ -4,11 +4,12 @@ from pathlib import Path
 # Base Paths
 BASE_DIR = Path(__file__).resolve().parent.parent
 BACKEND_DIR = BASE_DIR / "backend"
-DATA_DIR = BASE_DIR / "data"
+APP_STORAGE_DIR = Path(os.getenv("APP_STORAGE_DIR", str(BASE_DIR))).expanduser()
+DATA_DIR = APP_STORAGE_DIR / "data"
 UPLOADS_DIR = DATA_DIR / "uploads"
 EXTRACTED_DIR = DATA_DIR / "extracted"
 CHUNKS_DIR = DATA_DIR / "chunks"
-VECTOR_STORE_DIR = BASE_DIR / "vector_store"
+VECTOR_STORE_DIR = APP_STORAGE_DIR / "vector_store"
 
 # Ensure all directories exist
 for directory in [UPLOADS_DIR, EXTRACTED_DIR, CHUNKS_DIR, VECTOR_STORE_DIR]:

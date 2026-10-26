@@ -3,8 +3,13 @@ import shutil
 import time
 import json
 import logging
+import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+
+MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50"))
+MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,15 +39,24 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# Set FRONTEND_ORIGINS to a comma-separated list of deployed frontend origins.
-allowed_origins = [
-    origin.strip()
-    for origin in os.getenv(
-        "FRONTEND_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",
-    ).split(",")
-    if origin.strip()
-]
+DEFAULT_FRONTEND_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+
+
+def get_allowed_origins(raw_origins: Optional[str] = None) -> List[str]:
+    """Parses and normalizes comma-separated frontend origins, stripping whitespace and trailing slashes."""
+    if raw_origins is None:
+        raw_origins = os.getenv("FRONTEND_ORIGINS", "")
+    if not raw_origins.strip():
+        return list(DEFAULT_FRONTEND_ORIGINS)
+    parsed = [
+        origin.strip().rstrip("/")
+        for origin in raw_origins.split(",")
+        if origin.strip().rstrip("/")
+    ]
+    return parsed or list(DEFAULT_FRONTEND_ORIGINS)
+
+
+allowed_origins = get_allowed_origins()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -122,17 +136,53 @@ def get_current_document():
 
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(
             status_code=400,
             detail="Invalid file format. Only PDF files are supported."
         )
 
-    # Save uploaded file
     safe_filename = Path(file.filename).name
-    saved_path = UPLOADS_DIR / safe_filename
-    with open(saved_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    # Collision-resistant storage filename
+    unique_storage_filename = f"{uuid.uuid4().hex[:8]}_{safe_filename}"
+    saved_path = UPLOADS_DIR / unique_storage_filename
+
+    # Read first chunk to validate PDF magic signature
+    first_chunk = await file.read(1024)
+    if not first_chunk.startswith(b"%PDF-"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid PDF content. The uploaded file is not a valid PDF document."
+        )
+
+    # Stream upload in chunks while enforcing size limit
+    total_size = len(first_chunk)
+    try:
+        with open(saved_path, "wb") as buffer:
+            buffer.write(first_chunk)
+            while True:
+                chunk = await file.read(1024 * 64)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > MAX_UPLOAD_SIZE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Uploaded file exceeds maximum allowed size of {MAX_UPLOAD_SIZE_MB}MB."
+                    )
+                buffer.write(chunk)
+    except HTTPException:
+        if saved_path.exists():
+            saved_path.unlink(missing_ok=True)
+        raise
+    except Exception as io_err:
+        if saved_path.exists():
+            saved_path.unlink(missing_ok=True)
+        logger.error("I/O error while saving uploaded file: %s", io_err)
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred while saving the uploaded file."
+        )
 
     try:
         # 1. Extract and Chunk PDF
@@ -164,9 +214,14 @@ async def upload_pdf(file: UploadFile = File(...)):
         )
 
     except ValueError as ve:
+        logger.warning("PDF processing rejected: %s", ve)
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to process PDF: {str(e)}")
+        logger.exception("Failed to process uploaded PDF (%s)", type(e).__name__)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to process educational PDF. Please verify the document format and try again."
+        )
 
 @app.post("/ask")
 def ask_question(req: QuestionRequest):
