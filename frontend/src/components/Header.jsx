@@ -1,8 +1,10 @@
 import React from "react";
 
 export default function Header({ currentDoc, health }) {
-  const isOllamaOnline = health?.ollama?.online;
-  const modelName = health?.ollama?.model || "llama3.2:3b";
+  const llmStatus = health?.llm || health?.ollama;
+  const isLlmOnline = llmStatus?.online;
+  const providerName = llmStatus?.provider || "ollama";
+  const modelName = llmStatus?.model || "llama3.2:3b";
 
   return (
     <header className="app-header">
@@ -39,6 +41,15 @@ export default function Header({ currentDoc, health }) {
             <div className="no-doc-badge">
               <span className="status-dot warning"></span>
               <span>No PDF Active</span>
+            </div>
+          )}
+          {llmStatus && (
+            <div
+              className={`model-pill ${isLlmOnline ? "online" : "offline"}`}
+              title={llmStatus.message}
+            >
+              <span className={`status-dot ${isLlmOnline ? "pulse" : ""}`}></span>
+              <span>{providerName}: {modelName}</span>
             </div>
           )}
         </div>

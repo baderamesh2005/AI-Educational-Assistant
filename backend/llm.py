@@ -1,67 +1,97 @@
+
 import json
+import logging
 import time
 from typing import List, Dict, Any, Generator, Tuple
-import requests
 
-from backend.config import OLLAMA_BASE_URL, MODEL_NAME, TEMPERATURE, OLLAMA_TIMEOUT
+import requests
+from groq import APIConnectionError, APIStatusError, APITimeoutError, Groq
+
+from backend.config import (
+    LLM_PROVIDER,
+    OLLAMA_BASE_URL,
+    OLLAMA_MODEL_NAME,
+    GROQ_API_KEY,
+    GROQ_MODEL_NAME,
+    TEMPERATURE,
+    OLLAMA_TIMEOUT,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class ProviderUnavailableError(ConnectionError):
+    """Raised when the configured upstream LLM provider cannot be reached."""
+
+
+class LLMGenerationError(RuntimeError):
+    """Raised when the provider is reachable but generation fails."""
+
 
 class OllamaClient:
     def __init__(self):
         self.generate_url = f"{OLLAMA_BASE_URL}/api/generate"
         self.tags_url = f"{OLLAMA_BASE_URL}/api/tags"
+        self.provider = LLM_PROVIDER
+        self.groq_client = (
+            Groq(api_key=GROQ_API_KEY, timeout=OLLAMA_TIMEOUT)
+            if self.provider == "groq" and GROQ_API_KEY
+            else None
+        )
 
     def check_health(self) -> Tuple[bool, str]:
+        if self.provider == "groq":
+            if not self.groq_client:
+                return False, "Groq is selected but is not configured."
+            try:
+                models = self.groq_client.models.list()
+                available_models = {
+                    getattr(model, "id", "")
+                    for model in getattr(models, "data", [])
+                }
+                if GROQ_MODEL_NAME not in available_models:
+                    return False, "The configured Groq model is not available."
+                return True, f"Groq is online with model '{GROQ_MODEL_NAME}'."
+            except Exception as e:
+                logger.warning("Groq health check failed (%s).", type(e).__name__)
+                return False, "The configured AI provider is unavailable."
+
+        if self.provider != "ollama":
+            return False, "The configured AI provider is not supported."
+
         try:
             res = requests.get(self.tags_url, timeout=4)
-            if res.status_code == 200:
-                data = res.json()
-                models = [m.get("name") for m in data.get("models", [])]
-                base_target = MODEL_NAME.split(":")[0]
-                matched = any(base_target in m for m in models)
-                if matched:
-                    return True, f"Ollama is online with model '{MODEL_NAME}' available."
-                return True, f"Ollama is online, but model '{MODEL_NAME}' was not found in: {models}"
-            return False, f"Ollama returned HTTP status {res.status_code}"
+            res.raise_for_status()
+            models = [m.get("name", "") for m in res.json().get("models", [])]
+            matched = OLLAMA_MODEL_NAME in models
+            if matched:
+                return True, f"Ollama is online with model '{OLLAMA_MODEL_NAME}'."
+            return False, f"Ollama model '{OLLAMA_MODEL_NAME}' was not found."
         except Exception as e:
-            return False, f"Local AI model is not running. Please start Ollama. (Error: {e})"
+            logger.warning("Ollama health check failed (%s).", type(e).__name__)
+            return False, "The configured AI provider is unavailable."
 
-    def build_qa_prompt(self, question: str, retrieved_chunks: List[Dict[str, Any]]) -> str:
-        """
-        Constructs an exam-oriented prompt tailored to student question intent.
-        Strictly forbids embedding page numbers into the prose.
-        """
+    def build_qa_prompt(
+        self, question: str, retrieved_chunks: List[Dict[str, Any]]
+    ) -> str:
         context_parts = []
         for idx, chunk in enumerate(retrieved_chunks, 1):
             text = chunk.get("text", "").strip()
-            # Retain rich context for exam answers
             if len(text) > 700:
                 text = text[:700] + "..."
             context_parts.append(f"[Textbook Excerpt {idx}]:\n{text}")
 
         context_str = "\n\n".join(context_parts)
 
-        prompt = f"""You are an expert AI Educational Assistant and teacher preparing Class 12 students for board examinations.
-Your task is to provide an accurate, high-scoring, exam-ready answer based SOLELY on the textbook excerpts below.
+        return f"""You are an expert AI Educational Assistant and teacher preparing Class 12 students for board examinations.
+Answer based ONLY on the textbook excerpts below.
 
-CRITICAL INSTRUCTIONS:
-1. Base your answer EXCLUSIVELY on the provided textbook excerpts. Do not use outside facts.
-2. If the textbook excerpts do not contain enough facts to answer, respond with EXACTLY:
-   "I could not find sufficient information about this topic in the uploaded textbook."
-3. DO NOT MENTION PAGE NUMBERS ANYWHERE IN YOUR ANSWER. Do not say "According to page X", "On page X", or "Refer to page X". The page citation is displayed separately by the UI.
-4. TAILOR THE ANSWER STRUCTURE TO THE QUESTION INTENT:
-   - If the student asks to "Define X": Give a concise, standard textbook definition with units/symbols.
-   - If the student asks "What is X?": Provide a clear conceptual explanation with fundamental principles.
-   - If the student asks to "Explain X": Provide a thorough, descriptive, exam-ready explanation with underlying principles, key conditions, and points.
-   - If the student asks to "Describe X": Give a well-structured breakdown using headings or bullet points.
-   - If the student asks to "Differentiate between X and Y": Provide a clear point-by-point comparison.
-   - If the student asks to "Explain the process / mechanism of X": Provide a clear step-by-step sequence.
-   - For numerical questions: Use the standard structure:
-     Given:
-     Formula:
-     Substitution:
-     Calculation:
-     Final Answer:
-5. Maintain an academic, lucid, and encouraging tone suitable for writing in an examination.
+1. Do not use outside facts.
+2. If the excerpts are insufficient, respond exactly:
+"I could not find sufficient information about this topic in the uploaded textbook."
+3. Do not mention page numbers.
+4. Adapt the answer structure to the question: define, explain, compare, describe, or solve numerical problems step by step.
+5. Use a clear, exam-ready academic tone.
 
 TEXTBOOK EXCERPTS:
 {context_str}
@@ -70,79 +100,168 @@ STUDENT QUESTION:
 {question}
 
 EXAM-READY ANSWER:"""
-        return prompt
 
-    def generate_answer_sync(self, question: str, retrieved_chunks: List[Dict[str, Any]]) -> Tuple[str, float]:
+    def generate_answer_sync(
+        self, question: str, retrieved_chunks: List[Dict[str, Any]]
+    ) -> Tuple[str, float]:
         prompt = self.build_qa_prompt(question, retrieved_chunks)
-
-        payload = {
-            "model": MODEL_NAME,
-            "prompt": prompt,
-            "stream": False,
-            "keep_alive": "10m",
-            "options": {
-                "temperature": TEMPERATURE,
-                "num_thread": 8,
-                "num_predict": 550,
-                "top_p": 0.9,
-            }
-        }
-
         t0 = time.perf_counter()
-        try:
-            resp = requests.post(self.generate_url, json=payload, timeout=OLLAMA_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            answer = data.get("response", "").strip()
-        except requests.exceptions.ConnectionError:
-            raise ConnectionError("Local AI model is not running. Please start Ollama.")
-        except requests.exceptions.Timeout:
-            raise TimeoutError(f"Ollama generation timed out after {OLLAMA_TIMEOUT} seconds.")
-        except Exception as e:
-            raise RuntimeError(f"Ollama generation error: {e}")
 
-        llm_time = round(time.perf_counter() - t0, 4)
-        return answer, llm_time
+        try:
+            if self.provider == "groq":
+                if not self.groq_client:
+                    raise ProviderUnavailableError(
+                        "The configured AI provider is unavailable."
+                    )
+                response = self.groq_client.chat.completions.create(
+                    model=GROQ_MODEL_NAME,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=TEMPERATURE,
+                    max_tokens=550,
+                )
+                answer = response.choices[0].message.content or ""
+            elif self.provider == "ollama":
+                payload = {
+                    "model": OLLAMA_MODEL_NAME,
+                    "prompt": prompt,
+                    "stream": False,
+                    "keep_alive": "10m",
+                    "options": {
+                        "temperature": TEMPERATURE,
+                        "num_thread": 8,
+                        "num_predict": 550,
+                        "top_p": 0.9,
+                    },
+                }
+                resp = requests.post(
+                    self.generate_url, json=payload, timeout=OLLAMA_TIMEOUT
+                )
+                resp.raise_for_status()
+                answer = resp.json().get("response", "").strip()
+            else:
+                raise LLMGenerationError("The configured AI provider is not supported.")
+        except ProviderUnavailableError:
+            raise
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                APIConnectionError, APITimeoutError) as e:
+            logger.warning("LLM provider unavailable (%s).", type(e).__name__)
+            raise ProviderUnavailableError(
+                "The configured AI provider is unavailable."
+            ) from e
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else 0
+            logger.warning("Ollama request failed with status %s.", status_code)
+            if status_code in {401, 403, 404, 429} or status_code >= 500:
+                raise ProviderUnavailableError(
+                    "The configured AI provider is unavailable."
+                ) from e
+            raise LLMGenerationError("The AI provider could not generate a response.") from e
+        except APIStatusError as e:
+            logger.warning("Groq request failed with status %s.", e.status_code)
+            if e.status_code in {401, 403, 404, 429} or e.status_code >= 500:
+                raise ProviderUnavailableError(
+                    "The configured AI provider is unavailable."
+                ) from e
+            raise LLMGenerationError("The AI provider could not generate a response.") from e
+        except Exception as e:
+            logger.error("LLM generation failed (%s).", type(e).__name__)
+            raise LLMGenerationError(
+                "The AI provider could not generate a response."
+            ) from e
+
+        if not answer.strip():
+            raise LLMGenerationError("The AI provider returned an empty response.")
+
+        return answer.strip(), round(time.perf_counter() - t0, 4)
 
     def generate_answer_stream(
         self,
         question: str,
-        retrieved_chunks: List[Dict[str, Any]]
+        retrieved_chunks: List[Dict[str, Any]],
     ) -> Generator[str, None, None]:
         prompt = self.build_qa_prompt(question, retrieved_chunks)
 
-        payload = {
-            "model": MODEL_NAME,
-            "prompt": prompt,
-            "stream": True,
-            "keep_alive": "10m",
-            "options": {
-                "temperature": TEMPERATURE,
-                "num_thread": 8,
-                "num_predict": 550,
-                "top_p": 0.9,
-            }
-        }
-
         try:
-            with requests.post(self.generate_url, json=payload, stream=True, timeout=OLLAMA_TIMEOUT) as resp:
-                resp.raise_for_status()
-                for line in resp.iter_lines(decode_unicode=True):
-                    if not line:
-                        continue
-                    try:
-                        chunk_json = json.loads(line)
-                        token = chunk_json.get("response", "")
-                        yield token
-                        if chunk_json.get("done", False):
+            if self.provider == "groq":
+                if not self.groq_client:
+                    raise ProviderUnavailableError(
+                        "The configured AI provider is unavailable."
+                    )
+
+                stream = self.groq_client.chat.completions.create(
+                    model=GROQ_MODEL_NAME,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=TEMPERATURE,
+                    max_tokens=550,
+                    stream=True,
+                )
+                for event in stream:
+                    if event.choices:
+                        token = event.choices[0].delta.content
+                        if token:
+                            yield token
+            elif self.provider == "ollama":
+                payload = {
+                    "model": OLLAMA_MODEL_NAME,
+                    "prompt": prompt,
+                    "stream": True,
+                    "keep_alive": "10m",
+                    "options": {
+                        "temperature": TEMPERATURE,
+                        "num_thread": 8,
+                        "num_predict": 550,
+                        "top_p": 0.9,
+                    },
+                }
+                with requests.post(
+                    self.generate_url,
+                    json=payload,
+                    stream=True,
+                    timeout=OLLAMA_TIMEOUT,
+                ) as resp:
+                    resp.raise_for_status()
+                    for line in resp.iter_lines(decode_unicode=True):
+                        if not line:
+                            continue
+                        try:
+                            item = json.loads(line)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+                        token = item.get("response", "")
+                        if token:
+                            yield token
+                        if item.get("done", False):
                             break
-                    except json.JSONDecodeError:
-                        continue
-        except requests.exceptions.ConnectionError:
-            yield "\n\n**Error:** Local AI model is not running. Please start Ollama."
-        except requests.exceptions.Timeout:
-            yield f"\n\n**Error:** Ollama generation timed out after {OLLAMA_TIMEOUT} seconds."
+            else:
+                raise LLMGenerationError("The configured AI provider is not supported.")
+        except ProviderUnavailableError:
+            raise
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                APIConnectionError, APITimeoutError) as e:
+            logger.warning("LLM stream provider unavailable (%s).", type(e).__name__)
+            raise ProviderUnavailableError(
+                "The configured AI provider is unavailable."
+            ) from e
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else 0
+            logger.warning("Ollama stream failed with status %s.", status_code)
+            if status_code in {401, 403, 404, 429} or status_code >= 500:
+                raise ProviderUnavailableError(
+                    "The configured AI provider is unavailable."
+                ) from e
+            raise LLMGenerationError("The AI provider could not generate a response.") from e
+        except APIStatusError as e:
+            logger.warning("Groq stream failed with status %s.", e.status_code)
+            if e.status_code in {401, 403, 404, 429} or e.status_code >= 500:
+                raise ProviderUnavailableError(
+                    "The configured AI provider is unavailable."
+                ) from e
+            raise LLMGenerationError("The AI provider could not generate a response.") from e
         except Exception as e:
-            yield f"\n\n**Error during generation:** {str(e)}"
+            logger.error("LLM stream failed (%s).", type(e).__name__)
+            raise LLMGenerationError(
+                "The AI provider could not generate a response."
+            ) from e
+
 
 llm_client = OllamaClient()

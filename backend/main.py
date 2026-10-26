@@ -2,6 +2,7 @@ import os
 import shutil
 import time
 import json
+import logging
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -10,25 +11,42 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
-from backend.config import UPLOADS_DIR, TOP_K, MODEL_NAME
+from backend.config import (
+    ACTIVE_MODEL_NAME,
+    GROQ_MODEL_NAME,
+    LLM_PROVIDER,
+    OLLAMA_MODEL_NAME,
+    UPLOADS_DIR,
+    TOP_K,
+)
 from backend.document_processor import DocumentProcessor
 from backend.embedding import embedding_manager
 from backend.vector_store import vector_store
 from backend.retriever import retriever
-from backend.llm import llm_client
-from backend.mcq import mcq_generator
+from backend.llm import LLMGenerationError, ProviderUnavailableError, llm_client
+from backend.mcq import MCQGenerationError, mcq_generator
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="AI Educational Assistant API",
-    description="RAG-powered textbook learning assistant with Ollama and FAISS",
+    description="Textbook-grounded RAG learning assistant with Ollama or Groq and FAISS",
     version="2.0.0"
 )
 
-# Enable CORS for frontend development
+# Set FRONTEND_ORIGINS to a comma-separated list of deployed frontend origins.
+allowed_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "FRONTEND_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -43,21 +61,43 @@ class MCQRequest(BaseModel):
 @app.get("/")
 def root():
     return JSONResponse(
-        content={"message": "AI Educational Assistant API is running", "model": MODEL_NAME},
+        content={
+            "message": "AI Educational Assistant API is running",
+            "provider": LLM_PROVIDER,
+            "model": ACTIVE_MODEL_NAME,
+        },
         headers={"Content-Type": "application/json; charset=utf-8"}
     )
 
 @app.get("/health")
 def health_check():
-    ollama_ok, ollama_msg = llm_client.check_health()
+    llm_ok, llm_msg = llm_client.check_health()
     active_doc = vector_store.get_current_document()
+    provider_model = {
+        "ollama": OLLAMA_MODEL_NAME,
+        "groq": GROQ_MODEL_NAME,
+    }.get(LLM_PROVIDER, ACTIVE_MODEL_NAME)
+    llm_status = {
+        "provider": LLM_PROVIDER,
+        "online": llm_ok,
+        "message": llm_msg,
+        "model": provider_model,
+    }
     return JSONResponse(
         content={
-            "status": "healthy" if ollama_ok else "warning",
+            "status": "healthy" if llm_ok else "warning",
+            "llm": llm_status,
+            "provider": LLM_PROVIDER,
+            "model": provider_model,
+            # Retain the former field for clients that still read it.
             "ollama": {
-                "online": ollama_ok,
-                "message": ollama_msg,
-                "model": MODEL_NAME
+                "online": llm_ok if LLM_PROVIDER == "ollama" else False,
+                "message": (
+                    llm_msg
+                    if LLM_PROVIDER == "ollama"
+                    else "Ollama is not the configured provider."
+                ),
+                "model": OLLAMA_MODEL_NAME,
             },
             "vector_store": {
                 "has_active_doc": vector_store.has_active_document(),
@@ -167,10 +207,22 @@ def ask_question(req: QuestionRequest):
     # 2. Generate Descriptive Exam Answer
     try:
         answer, llm_sec = llm_client.generate_answer_sync(q, chunks)
-    except ConnectionError:
-        raise HTTPException(status_code=503, detail="Local AI model is not running. Please start Ollama.")
+    except ProviderUnavailableError:
+        raise HTTPException(
+            status_code=503,
+            detail="The configured AI provider is unavailable. Please check the provider configuration and try again.",
+        )
+    except LLMGenerationError:
+        raise HTTPException(
+            status_code=502,
+            detail="The configured AI provider could not generate a response. Please try again.",
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("Q&A generation failed (%s).", type(e).__name__)
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while generating the answer.",
+        )
 
     total_sec = round(time.perf_counter() - t_start, 4)
 
@@ -218,54 +270,74 @@ def ask_question_stream(req: QuestionRequest):
 
     def event_stream():
         t_start = time.perf_counter()
-        chunks, metrics = retriever.retrieve(q, top_k=TOP_K)
-        
-        sources = [
-            {
-                "page": c.get("page", 1),
-                "chunk_id": c.get("chunk_id", 0),
-                "text": c.get("text", "")[:320] + "..." if len(c.get("text", "")) > 320 else c.get("text", ""),
-                "similarity": round(c.get("raw_similarity", c.get("similarity", 0.0)), 3)
-            }
-            for c in chunks
-        ]
-        primary_page = chunks[0].get("page", 1) if chunks else None
+        try:
+            chunks, metrics = retriever.retrieve(q, top_k=TOP_K)
 
-        # Emit meta event with sources and evidence confidence
-        init_payload = {
-            "type": "meta",
-            "primary_page": primary_page,
-            "confidence_pct": metrics.get("confidence_pct", 20 if not chunks else 85),
-            "source_match_pct": metrics.get("source_match_pct", 15 if not chunks else 80),
-            "sources": sources,
-            "embedding_sec": metrics.get("embedding_sec", 0),
-            "retrieval_sec": metrics.get("retrieval_sec", 0)
-        }
-        yield f"data: {json.dumps(init_payload)}\n\n"
+            sources = [
+                {
+                    "page": c.get("page", 1),
+                    "chunk_id": c.get("chunk_id", 0),
+                    "text": c.get("text", "")[:320] + "..." if len(c.get("text", "")) > 320 else c.get("text", ""),
+                    "similarity": round(c.get("raw_similarity", c.get("similarity", 0.0)), 3)
+                }
+                for c in chunks
+            ]
+            primary_page = chunks[0].get("page", 1) if chunks else None
 
-        if not chunks or not metrics.get("is_grounded", False):
-            yield f"data: {json.dumps({'type': 'token', 'token': 'I could not find sufficient information about this topic in the uploaded textbook.'})}\n\n"
-            yield f"data: {json.dumps({'type': 'done', 'total_sec': round(time.perf_counter() - t_start, 4)})}\n\n"
-            return
-
-        # Stream tokens
-        t_llm_start = time.perf_counter()
-        for token in llm_client.generate_answer_stream(q, chunks):
-            yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
-
-        llm_sec = round(time.perf_counter() - t_llm_start, 4)
-        total_sec = round(time.perf_counter() - t_start, 4)
-
-        done_payload = {
-            "type": "done",
-            "timing": {
+            init_payload = {
+                "type": "meta",
+                "primary_page": primary_page,
+                "confidence_pct": metrics.get("confidence_pct", 20 if not chunks else 85),
+                "source_match_pct": metrics.get("source_match_pct", 15 if not chunks else 80),
+                "sources": sources,
                 "embedding_sec": metrics.get("embedding_sec", 0),
-                "retrieval_sec": metrics.get("retrieval_sec", 0),
-                "llm_sec": llm_sec,
-                "total_sec": total_sec
+                "retrieval_sec": metrics.get("retrieval_sec", 0)
             }
-        }
-        yield f"data: {json.dumps(done_payload)}\n\n"
+            yield f"data: {json.dumps(init_payload)}\n\n"
+
+            if not chunks or not metrics.get("is_grounded", False):
+                token_payload = {
+                    "type": "token",
+                    "token": "I could not find sufficient information about this topic in the uploaded textbook.",
+                }
+                yield f"data: {json.dumps(token_payload)}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'status': 'completed', 'total_sec': round(time.perf_counter() - t_start, 4)})}\n\n"
+                return
+
+            t_llm_start = time.perf_counter()
+            for token in llm_client.generate_answer_stream(q, chunks):
+                yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
+
+            done_payload = {
+                "type": "done",
+                "status": "completed",
+                "timing": {
+                    "embedding_sec": metrics.get("embedding_sec", 0),
+                    "retrieval_sec": metrics.get("retrieval_sec", 0),
+                    "llm_sec": round(time.perf_counter() - t_llm_start, 4),
+                    "total_sec": round(time.perf_counter() - t_start, 4)
+                }
+            }
+            yield f"data: {json.dumps(done_payload)}\n\n"
+        except ProviderUnavailableError:
+            error = {
+                "type": "error",
+                "message": "The configured AI provider is unavailable. Please check the provider configuration and try again.",
+            }
+            yield f"data: {json.dumps(error)}\n\n"
+        except LLMGenerationError:
+            error = {
+                "type": "error",
+                "message": "The configured AI provider could not generate a response. Please try again.",
+            }
+            yield f"data: {json.dumps(error)}\n\n"
+        except Exception as e:
+            logger.error("Answer stream failed (%s).", type(e).__name__)
+            error = {
+                "type": "error",
+                "message": "An unexpected error occurred while generating the answer.",
+            }
+            yield f"data: {json.dumps(error)}\n\n"
 
     return StreamingResponse(
         event_stream(),
@@ -296,10 +368,24 @@ def generate_mcqs_endpoint(req: MCQRequest):
 
     try:
         mcqs, llm_sec = mcq_generator.generate_mcqs(topic, chunks)
-    except ConnectionError:
-        raise HTTPException(status_code=503, detail="Local AI model is not running. Please start Ollama.")
+    except ProviderUnavailableError:
+        raise HTTPException(
+            status_code=503,
+            detail="The configured AI provider is unavailable. Please check the provider configuration and try again.",
+        )
+    except MCQGenerationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except LLMGenerationError:
+        raise HTTPException(
+            status_code=502,
+            detail="The configured AI provider could not generate the questions. Please try again.",
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("MCQ endpoint failed (%s).", type(e).__name__)
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while generating questions.",
+        )
 
     total_sec = round(time.perf_counter() - t_start, 4)
 

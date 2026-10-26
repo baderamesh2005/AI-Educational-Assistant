@@ -9,7 +9,7 @@ An AI-powered educational assistant that uses **Retrieval-Augmented Generation (
 - ✂️ Split documents into meaningful chunks
 - 🧠 Generate embeddings using Sentence Transformers
 - ⚡ Store and search embeddings using FAISS
-- 🤖 Generate answers using a local LLM through Ollama
+- 🤖 Generate answers using Ollama or the optional Groq provider
 - 📚 Ask questions based on the uploaded document
 - 📝 Generate exactly 5 exam-style MCQs for a selected topic
 - ✅ Interactive MCQ practice and instant grading
@@ -179,6 +179,15 @@ npm
 Ollama
 Llama 3.2 3B
 Modern web browser
+
+Provider and Deployment Configuration
+The backend defaults to local Ollama and does not require a Groq API key. For Groq, set `LLM_PROVIDER=groq`, `GROQ_API_KEY`, and optionally `GROQ_MODEL_NAME`. For Ollama, set `LLM_PROVIDER=ollama` and optionally `OLLAMA_BASE_URL` or `OLLAMA_MODEL_NAME`.
+
+For a deployed frontend, set `VITE_API_BASE_URL` to the backend's public API origin. Set backend `FRONTEND_ORIGINS` to the comma-separated frontend origins allowed by CORS. Local development keeps the frontend API default at `http://127.0.0.1:8008` and allows Vite origins on port 5173.
+
+Answer Stream Events
+`POST /ask/stream` sends Server-Sent Events whose `data` is a JSON object with a `type` field. `meta` carries source pages, confidence percentages, and retrieved sources; `token` carries an answer fragment; `error` carries a safe user-facing `message` and is terminal; `done` carries `status: "completed"` and timing data when generation completes. An `error` event is not followed by `done`.
+
 Project Goal
 
 The goal of this project is to provide students with an interactive AI learning assistant that can understand educational material from uploaded PDFs and help them:

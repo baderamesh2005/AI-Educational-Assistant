@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import axios from "axios";
 
-const API_BASE = "http://127.0.0.1:8008";
+const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8008";
 
 export default function MCQPractice({ currentDoc }) {
   const [topic, setTopic] = useState("");
@@ -148,7 +148,7 @@ export default function MCQPractice({ currentDoc }) {
 
       {errorMsg && (
         <div className="alert-box error">
-          <span className="alert-icon">??</span>
+          <span className="alert-icon">!</span>
           <span>{errorMsg}</span>
         </div>
       )}
@@ -168,7 +168,7 @@ export default function MCQPractice({ currentDoc }) {
           <div className="quiz-header">
             <div>
               <h3 className="quiz-title">Quiz: {topic}</h3>
-              <p className="quiz-subtitle">5 Exam Questions � 4 Options Each</p>
+              <p className="quiz-subtitle">5 Exam Questions - 4 Options Each</p>
             </div>
 
             {isSubmitted && (
@@ -234,10 +234,10 @@ export default function MCQPractice({ currentDoc }) {
                           <span className="option-marker">{optKey}</span>
                           <span className="option-text">{optText}</span>
                           {isSubmitted && isOptionCorrect && (
-                            <span className="indicator-icon correct">?</span>
+                            <span className="indicator-icon correct">{"\u2713"}</span>
                           )}
                           {isSubmitted && isSelected && !isOptionCorrect && (
-                            <span className="indicator-icon wrong">?</span>
+                            <span className="indicator-icon wrong">{"\u00d7"}</span>
                           )}
                         </button>
                       );
@@ -249,7 +249,7 @@ export default function MCQPractice({ currentDoc }) {
                       {isCorrect ? (
                         <>
                           <div className="eval-status-row">
-                            <span className="eval-badge correct">? Correct</span>
+                            <span className="eval-badge correct">{"\u2713"} Correct</span>
                             <span className="student-ans-note">
                               Your Answer: <strong>Option {selectedKey}</strong>
                             </span>
@@ -262,7 +262,7 @@ export default function MCQPractice({ currentDoc }) {
                       ) : (
                         <>
                           <div className="eval-status-row">
-                            <span className="eval-badge incorrect">? Incorrect</span>
+                            <span className="eval-badge incorrect">{"\u00d7"} Incorrect</span>
                             <span className="student-ans-note">
                               Your Answer: <strong>Option {selectedKey || "None"}</strong> | Correct Answer: <strong>Option {correctKey}</strong>
                             </span>

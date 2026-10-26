@@ -1,7 +1,7 @@
 import React, { useState, useRef } from "react";
 import axios from "axios";
 
-const API_BASE = "http://127.0.0.1:8008";
+const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8008";
 
 export default function FileUpload({ currentDoc, onDocUpdated }) {
   const [file, setFile] = useState(null);
@@ -20,7 +20,7 @@ export default function FileUpload({ currentDoc, onDocUpdated }) {
     "Creating chunks...",
     "Generating embeddings...",
     "Building knowledge base...",
-    "PDF Ready ?"
+    "PDF Ready"
   ];
 
   const handleDragOver = (e) => {
@@ -179,7 +179,7 @@ export default function FileUpload({ currentDoc, onDocUpdated }) {
                 }`}
               >
                 <span className="stage-icon">
-                  {idx < stageIndex ? "?" : idx === stageIndex ? "?" : "?"}
+                  {idx < stageIndex ? "\u2713" : idx === stageIndex ? "\u2022" : "\u00b7"}
                 </span>
                 <span>{stg}</span>
               </div>
@@ -190,7 +190,7 @@ export default function FileUpload({ currentDoc, onDocUpdated }) {
 
       {errorMsg && (
         <div className="alert-box error">
-          <span className="alert-icon">??</span>
+          <span className="alert-icon">!</span>
           <span>{errorMsg}</span>
         </div>
       )}
@@ -198,7 +198,7 @@ export default function FileUpload({ currentDoc, onDocUpdated }) {
       {(successInfo || (currentDoc && currentDoc.status === "ready")) && (
         <div className="ready-doc-card">
           <div className="ready-header">
-            <span className="check-badge">?</span>
+            <span className="check-badge">{"\u2713"}</span>
             <span className="ready-title">PDF Ready</span>
           </div>
 
