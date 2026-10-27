@@ -39,7 +39,11 @@ app = FastAPI(
     version="2.0.0"
 )
 
-DEFAULT_FRONTEND_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+DEFAULT_FRONTEND_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://ai-educational-assistant-chi.vercel.app",
+]
 
 
 def get_allowed_origins(raw_origins: Optional[str] = None) -> List[str]:

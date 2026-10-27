@@ -13,9 +13,11 @@ from backend.embedding import EmbeddingManager, embedding_manager
 
 
 class LazyStartupAndHealthTests(unittest.TestCase):
+    def setUp(self):
+        EmbeddingManager._reset_singleton()
+
     def test_import_and_health_do_not_load_embedding_model(self):
-        """Verifies that importing main and querying /health does not eagerly instantiate SentenceTransformer."""
-        # Fresh isolated manager
+        """Verifies that importing main and querying /health does not eagerly instantiate ONNX model."""
         manager = EmbeddingManager()
         self.assertFalse(manager.is_loaded())
 
@@ -35,15 +37,17 @@ class LazyStartupAndHealthTests(unittest.TestCase):
     def test_lazy_loading_only_triggers_on_encoding_call(self):
         """Verifies that _ensure_model is deferred until encode_texts or encode_query is called."""
         test_mgr = EmbeddingManager()
-        # Mock SentenceTransformer so no real weights or network calls are made
-        mock_st = Mock()
-        mock_st.return_value.encode.return_value = Mock(astype=lambda x: [0.1, 0.2])
 
-        with patch("sentence_transformers.SentenceTransformer", mock_st):
-            # Model should still not be loaded before call
+        mock_session = Mock()
+        mock_tokenizer = Mock()
+
+        with (
+            patch("huggingface_hub.hf_hub_download", return_value="/mock/path"),
+            patch("tokenizers.Tokenizer.from_file", return_value=mock_tokenizer),
+            patch("onnxruntime.InferenceSession", return_value=mock_session),
+        ):
             self.assertFalse(test_mgr.is_loaded())
-            # Encoding triggers lazy loading
-            test_mgr._ensure_model()
+            test_mgr._ensure_model(local_files_only=True)
             self.assertTrue(test_mgr.is_loaded())
 
 
